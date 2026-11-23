@@ -44,10 +44,10 @@ tap-jira = "tap_jira.tap:TapJira.cli"
 dev = [
   "mypy>=2.4.1",
   "pytest>=9.2.0",
-  "ruff>=0.17.3",
+  "ruff>=0.17.6",
   "singer-sdk[testing]",
-  "ty>=0.0.94",
-  "types-requests>=2.33.0.20261006",
+  "ty>=0.0.107",
+  "types-requests>=2.33.0.20261030",
 ]
 
 [tool.hatch.version]
