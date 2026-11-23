@@ -43,6 +43,24 @@ plugins:
     - name: stream_options.issues.jql
       kind: string
       description: A JQL query to filter issues
+    - name: backfill.project
+      kind: string
+      description: Jira project key (or numeric project ID) to backfill in a one-off run
+    - name: backfill.start_date
+      kind: date_iso8601
+      description: Start of the one-off backfill window (defaults to start_date)
+    - name: backfill.end_date
+      kind: date_iso8601
+      description: End of the one-off backfill window (defaults to end_date)
+    - name: backfill_project
+      kind: string
+      description: Shorthand for backfill.project
+    - name: backfill_start_date
+      kind: date_iso8601
+      description: Shorthand for backfill.start_date
+    - name: backfill_end_date
+      kind: date_iso8601
+      description: Shorthand for backfill.end_date
     - name: include_audit_logs
       kind: boolean
       value: false

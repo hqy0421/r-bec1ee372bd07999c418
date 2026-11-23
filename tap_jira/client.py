@@ -7,6 +7,15 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import requests.auth
 from singer_sdk.streams import RESTStream
+from singer_sdk.streams._state import StreamStateManager
+
+from tap_jira.backfill import (
+    BACKFILL_STREAM_NAMES,
+    BackfillScope,
+    backfill_state_namespace,
+    later_of,
+    scope_from_config,
+)
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -15,9 +24,10 @@ else:
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
+    from datetime import datetime
 
     from requests import Response
-    from singer_sdk.helpers.types import Context
+    from singer_sdk.helpers.types import Context, TapState
 
     _Auth = Callable[[requests.PreparedRequest], requests.PreparedRequest]
 
@@ -40,6 +50,128 @@ class JiraStream(RESTStream[_TNextPageToken]):
     next_page_token_jsonpath = "$.paging.start"  # noqa: S105
     records_jsonpath = "$[*]"  # Or override `parse_response`.
     instance_name: str
+
+    @property
+    def backfill_scope(self) -> BackfillScope | None:
+        """Return the configured backfill scope for this stream, if any.
+
+        Only streams that take part in a backfill run honor the ``backfill``
+        setting; every other stream keeps its ordinary incremental behavior.
+
+        Returns:
+            The configured scope, or ``None`` when this stream is not part of a
+            backfill.
+        """
+        if self.name not in BACKFILL_STREAM_NAMES:
+            return None
+        return scope_from_config(self.config)
+
+    @property
+    def backfill_state(self) -> TapState | None:
+        """Return the isolated STATE namespace used for backfill progress.
+
+        Returns:
+            The backfill namespace, or ``None`` when no backfill is configured.
+        """
+        scope = self.backfill_scope
+        if scope is None:
+            return None
+        return backfill_state_namespace(self.tap_state, scope)
+
+    def backfill_starting_timestamp(
+        self,
+        context: Context | None,
+    ) -> datetime | None:
+        """Return the (page-stable) lower bound of a backfill request.
+
+        During a sync the SDK records the run's starting value in the state
+        ``starting_replication_value`` marker once, before paging, so every page
+        of the same request uses the same bound.  Before the first marker is
+        written (or when a caller asks outside a sync) fall back to the later of
+        the window start and any bookmark already persisted for this backfill.
+
+        Args:
+            context: Stream partition or context dictionary.
+
+        Returns:
+            The effective lower bound, or ``None`` when the backfill is unbounded
+            below.
+        """
+        scope = self.backfill_scope
+        if scope is None:
+            return None
+
+        state = self.state_manager.get_context_state(context)
+
+        marker = state.get("starting_replication_value")
+        if marker is not None:
+            return self._parse_datetime(marker)
+
+        bookmark: datetime | None = None
+        value = state.get("replication_key_value")
+        if value and state.get("replication_key") == self.replication_key:
+            bookmark = self._parse_datetime(value)
+
+        return later_of(scope.start_date, bookmark)
+
+    @override
+    @property
+    def state_manager(self) -> StreamStateManager:
+        """Return the state manager, redirected during a backfill run.
+
+        Backfill progress is written to an isolated namespace so that the
+        global ``bookmarks`` handed to the incremental target never move.
+
+        Returns:
+            The state manager for this stream.
+        """
+        manager = getattr(self, "_backfill_state_manager", None)
+        if manager is not None:
+            return manager  # type: ignore[no-any-return]
+
+        scope = self.backfill_scope
+        if scope is None:
+            return super().state_manager
+
+        manager = StreamStateManager(
+            tap_name=self.tap_name,
+            stream_name=self.name,
+            tap_state=backfill_state_namespace(self.tap_state, scope),
+            state_partitioning_keys=self.state_partitioning_keys,
+            is_sorted=self.is_sorted,
+            check_sorted=self.check_sorted,
+        )
+        self._backfill_state_manager = manager
+        return manager
+
+    @override
+    def _write_starting_replication_value(
+        self,
+        context: Context | None,
+    ) -> None:
+        """Write the starting replication value, scoped to the backfill.
+
+        Args:
+            context: Stream partition or context dictionary.
+        """
+        scope = self.backfill_scope
+        if scope is None:
+            super()._write_starting_replication_value(context)
+            return
+
+        config = dict(self.config)
+        if scope.start_date is not None:
+            config["start_date"] = scope.start_date.isoformat()
+        else:
+            config.pop("start_date", None)
+
+        self.state_manager.write_starting_replication_value(
+            context=context,
+            replication_method=self.replication_method,
+            replication_key=self.replication_key,
+            config=config,
+            compare_start_date_fn=self.compare_start_date,
+        )
 
     @override
     @property

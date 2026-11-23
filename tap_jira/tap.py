@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from singer_sdk import Tap
 from singer_sdk import typing as th  # JSON schema typing helpers
 
 from tap_jira import streams
+from tap_jira.backfill import (
+    BACKFILL_STATE_KEY,
+    BackfillPlan,
+    backfill_state_namespace,
+    plan_from_config,
+)
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -38,6 +44,56 @@ class TapJira(Tap):
             "end_date",
             th.DateTimeType,
             description="Latest record date to sync",
+        ),
+        th.Property(
+            "backfill",
+            th.ObjectType(
+                th.Property(
+                    "project",
+                    th.StringType,
+                    description=(
+                        "The Jira project key (or numeric project ID) whose issues "
+                        "should be backfilled."
+                    ),
+                ),
+                th.Property(
+                    "start_date",
+                    th.DateTimeType,
+                    description=(
+                        "Start of the backfill window. Defaults to the top-level "
+                        "'start_date'."
+                    ),
+                ),
+                th.Property(
+                    "end_date",
+                    th.DateTimeType,
+                    description=(
+                        "End of the backfill window. Defaults to the top-level "
+                        "'end_date'."
+                    ),
+                ),
+            ),
+            description=(
+                "Plan a one-off backfill of a single project's issues. While a "
+                "backfill is configured only the issues stream and its child "
+                "streams sync, request and STATE scopes are limited to this window, "
+                "and the global incremental bookmark is left untouched."
+            ),
+        ),
+        th.Property(
+            "backfill_project",
+            th.StringType,
+            description="Shorthand for 'backfill.project'.",
+        ),
+        th.Property(
+            "backfill_start_date",
+            th.DateTimeType,
+            description="Shorthand for 'backfill.start_date'.",
+        ),
+        th.Property(
+            "backfill_end_date",
+            th.DateTimeType,
+            description="Shorthand for 'backfill.end_date'.",
         ),
         th.Property(
             "domain",
@@ -156,3 +212,88 @@ class TapJira(Tap):
             stream_list.append(streams.AuditingStream(self))
 
         return stream_list
+
+    @override
+    def load_state(self, state: dict[str, Any]) -> None:
+        """Load state, preserving the isolated backfill namespace.
+
+        The SDK's default loader only understands ``bookmarks``.  A backfill
+        tracks its progress under a separate top-level ``backfill`` key, so
+        restore that namespace verbatim to allow an interrupted backfill to
+        resume without disturbing the global bookmarks.
+
+        Args:
+            state: Initialize the tap's state with this value.
+        """
+        namespace = state.get(BACKFILL_STATE_KEY)
+        super().load_state(state)
+
+        if isinstance(namespace, dict):
+            cast("dict[str, Any]", self.state)[BACKFILL_STATE_KEY] = namespace
+
+    @property
+    def backfill_plan(self) -> BackfillPlan | None:
+        """Return the configured one-off backfill plan, if any.
+
+        Returns:
+            The resolved backfill plan, or ``None`` for an ordinary sync.
+
+        Raises:
+            TypeError: If the ``backfill`` setting is not an object.
+            ValueError: If the ``backfill`` settings are malformed.
+        """
+        return plan_from_config(self.config)
+
+    def _sync_backfill(self, plan: BackfillPlan) -> None:
+        """Run a one-off, project-scoped backfill.
+
+        Only the backfilled streams are synced.  Their STATE is tracked in an
+        isolated ``backfill`` namespace, so the ordinary ``bookmarks`` handed to
+        the incremental target are never modified.
+
+        Args:
+            plan: The backfill plan to execute.
+        """
+        self.logger.info("Planned backfill: %s", plan.describe())
+
+        # Materialize the isolated state namespace up-front so every STATE
+        # message emitted during the run carries the backfill scope.
+        backfill_state_namespace(self.state, plan.scope)
+
+        # The plan decides exactly which streams run: the issues stream and the
+        # streams fetched per issue. Every other stream is deselected.
+        for stream in self.streams.values():
+            stream.selected = stream.name in plan.streams
+
+        if self.state:
+            self._state_writer.write_state(self.state)
+
+        for stream in self.streams.values():
+            if not stream.selected and not stream.has_selected_descendents:
+                continue
+            if stream.parent_stream_type:
+                self.logger.debug(
+                    "Backfill child stream '%s' is synced by its parent '%s'.",
+                    stream.name,
+                    stream.parent_stream_type.__name__,
+                )
+                continue
+
+            stream.sync()
+            stream.finalize_state_progress_markers()
+
+        for stream in self.streams.values():
+            stream.log_sync_costs()
+
+    def sync_all(self) -> None:  # type: ignore[misc]  # ty: ignore[override-of-final-method]
+        """Sync the tap, honoring a configured backfill plan.
+
+        When a ``backfill`` scope is configured only that one-off backfill runs;
+        otherwise this is the SDK's ordinary sync.
+        """
+        plan = self.backfill_plan
+        if plan is None:
+            super().sync_all()
+            return
+
+        self._sync_backfill(plan)

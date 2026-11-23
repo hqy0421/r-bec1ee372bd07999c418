@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import operator
 import sys
+from dataclasses import replace
 from datetime import datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
@@ -1868,16 +1869,32 @@ class IssueStream(JiraStream[str]):
         if next_page_token:
             params["nextPageToken"] = next_page_token
 
-        if start_date := self.get_starting_timestamp(context):
-            start_date_fmt = start_date.strftime("%Y-%m-%d %H:%M")
+        if backfill := self.backfill_scope:
+            # A backfill replays exactly one project over its own time window.
+            # It deliberately ignores the global bookmark and the top-level
+            # ``end_date`` so requests stay inside the backfill's scope.
+            start_date = self.backfill_starting_timestamp(context)
+            scope = (
+                backfill
+                if start_date is None
+                else replace(backfill, start_date=start_date)
+            )
 
-            jql.append(f"(created>='{start_date_fmt}' or updated>='{start_date_fmt}')")
+            jql.append(scope.project_clause)
+            jql.extend(scope.jql_bounds())
+        else:
+            if start_date := self.get_starting_timestamp(context):
+                start_date_fmt = start_date.strftime("%Y-%m-%d %H:%M")
 
-        if "end_date" in self.config:
-            end_date = datetime.fromisoformat(self.config["end_date"])
-            end_date_fmt = end_date.strftime("%Y-%m-%d %H:%M")
+                jql.append(
+                    f"(created>='{start_date_fmt}' or updated>='{start_date_fmt}')",
+                )
 
-            jql.append(f"(created<'{end_date_fmt}' or updated<'{end_date_fmt}')")
+            if "end_date" in self.config:
+                end_date = datetime.fromisoformat(self.config["end_date"])
+                end_date_fmt = end_date.strftime("%Y-%m-%d %H:%M")
+
+                jql.append(f"(created<'{end_date_fmt}' or updated<'{end_date_fmt}')")
 
         base_jql = (self.config.get("stream_options", {}).get("issues", {})).get(
             "jql",

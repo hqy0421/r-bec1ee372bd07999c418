@@ -38,6 +38,13 @@ Built with the [Meltano Singer SDK](https://sdk.meltano.com).
 | stream_options.issues.jql    | False    | id != null | A JQL query to filter issues                                                     |
 | stream_options.issues.fields | False    | *all       | A comma-separated list of fields to include. All fields are included by default. |
 | include_audit_logs           | False    | False      | Include the audit logs stream                                                    |
+| backfill                     | False    | None       | Plan a one-off backfill of a single project's issues (see below).                |
+| backfill.project             | False    | None       | Jira project key (or numeric project ID) to backfill.                            |
+| backfill.start_date          | False    | None       | Start of the backfill window. Defaults to the top-level `start_date`.            |
+| backfill.end_date            | False    | None       | End of the backfill window. Defaults to the top-level `end_date`.                |
+| backfill_project             | False    | None       | Shorthand for `backfill.project`.                                                |
+| backfill_start_date          | False    | None       | Shorthand for `backfill.start_date`.                                             |
+| backfill_end_date            | False    | None       | Shorthand for `backfill.end_date`.                                               |
 
 ### Built-in capabilities
 
@@ -178,6 +185,39 @@ You can easily run `tap-jira` by itself or in a pipeline using [Meltano](https:/
 ## Stream Inheritance
 
 This project uses parent-child streams. Learn more about them [here](https://gitlab.com/meltano/sdk/-/blob/main/docs/parent_streams.md).
+
+## Backfilling a single project
+
+If the historical/theme table is missing the issues of one Jira project, configure
+a one-off backfill instead of replaying the whole stream:
+
+```json
+{
+  "domain": "mycompany.atlassian.net",
+  "email": "me@example.com",
+  "api_token": "...",
+  "backfill": {
+    "project": "ABC",
+    "start_date": "2024-01-01T00:00:00Z",
+    "end_date": "2024-02-01T00:00:00Z"
+  }
+}
+```
+
+While a backfill is configured:
+
+* Only the `issues` stream and its child streams (`issue_changelog`,
+  `issue_comments`, `issue_watchers`, `issue_worklogs`) sync.
+* Every issues request is limited to `project = ABC` and the configured window,
+  and the child streams run only for the issues fetched by that request.
+* Emitted STATE carries the backfill scope and progress under a separate
+  top-level `backfill` key, so the global incremental bookmark is not consumed.
+* When the backfill finishes, the ordinary `bookmarks` handed to the incremental
+  target are exactly what they were before it started.
+
+The backfill progress is resumable: if the run is interrupted, rerun with the
+same scope and it continues from the isolated bookmark. Changing the scope
+starts a fresh backfill and discards stale progress.
 
 ### Executing the Tap Directly
 
